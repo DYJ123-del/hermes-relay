@@ -1902,6 +1902,10 @@ class DashboardApiClientTest {
         val body = request.body.readUtf8()
         assertTrue(body.contains(""""archived":true"""))
         assertTrue(body.contains(""""profile":"mizu""""))
+        // Sidebar writes are revision-fenced only: a generation fence would race the
+        // live turn's generation bump and surface as a bogus stale_generation.
+        assertTrue(body.contains(""""expected_revision":3"""))
+        assertFalse(body.contains("expected_generation"))
     }
 
     @Test
@@ -1951,7 +1955,9 @@ class DashboardApiClientTest {
         assertEquals("mizu", request.requestUrl!!.queryParameter("profile"))
         val body = request.body.readUtf8()
         assertTrue(body.contains(""""pinned":true"""))
-        assertTrue(body.contains(""""profile":"mizu"""))
+        assertTrue(body.contains(""""profile":"mizu""""))
+        assertTrue(body.contains(""""expected_revision":2"""))
+        assertFalse(body.contains("expected_generation"))
     }
 
     @Test
@@ -1979,6 +1985,8 @@ class DashboardApiClientTest {
         assertTrue(body.contains(""""title":"New title""""))
         // Current upstream reads profile from the PATCH body, not the query.
         assertTrue(body.contains(""""profile":"mizu""""))
+        assertTrue(body.contains(""""expected_revision":5"""))
+        assertFalse(body.contains("expected_generation"))
     }
 
     @Test
@@ -2026,6 +2034,21 @@ class DashboardApiClientTest {
         val delete = server.takeRequest()
         assertEquals("DELETE", delete.method)
         assertEquals(null, delete.requestUrl!!.queryParameter("request_id"))
+    }
+
+    @Test
+    fun deleteSession_surfacesSnapshotFaultInsteadOfDowngrading() = runTest {
+        // A 500 on the snapshot is a real fault, not "server too old": sending the
+        // unfenced write would come back as a misleading client_upgrade_required.
+        server.enqueue(MockResponse().setResponseCode(500).setBody("""{"detail":"boom"}"""))
+
+        val client = DashboardApiClient(baseUrl = server.url("/").toString())
+        val result = client.deleteSession("sess-old", profile = "mizu")
+
+        assertTrue(result.isFailure)
+        server.takeRequest()
+        // Only the snapshot left the client; no unfenced DELETE followed it.
+        assertEquals(1, server.requestCount)
     }
 
     @Test

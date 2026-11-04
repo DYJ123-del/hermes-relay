@@ -1389,9 +1389,9 @@ class DashboardApiClient(
 
     /**
      * Hermes v0.22.3+ refuses every session write that carries no *mutation
-     * identity*: `DELETE`/`PATCH /api/sessions/{id}` answer `409
-     * client_upgrade_required` when `request_id`/`expected_revision` are
-     * missing and `400 invalid_params` when only `expected_generation` is.
+     * identity*. All three missing → `409 client_upgrade_required`; only
+     * `request_id`/`expected_revision` missing → `409 mutation_identity_required`;
+     * a delete without `expected_generation` → `400 invalid_params`.
      * The trio comes from `GET /api/sessions/{id}/mutation-snapshot` — the same
      * preflight official Desktop runs before a sidebar control. Servers older
      * than the fence answer 404 here; [sessionMutationFence] then returns null
@@ -1406,21 +1406,39 @@ class DashboardApiClient(
     private suspend fun sessionMutationFence(
         sessionId: String,
         profile: String?,
-    ): SessionMutationFence? = getJsonObject(
+    ): Result<SessionMutationFence?> = getJsonObject(
         "/api/sessions/${pathSegment(sessionId)}/mutation-snapshot${profileQuery(profile)}",
-    ).getOrNull()?.let { root ->
-        SessionMutationFence(
-            requestId = UUID.randomUUID().toString(),
-            revision = root["runtime_revision"]?.jsonPrimitive?.longOrNull ?: 0L,
-            generation = root["runtime_generation"]?.jsonPrimitive?.longOrNull ?: 0L,
-        )
-    }
+    ).fold(
+        onSuccess = { root ->
+            Result.success<SessionMutationFence?>(
+                SessionMutationFence(
+                    requestId = UUID.randomUUID().toString(),
+                    revision = (root["runtime_revision"] as? JsonPrimitive)?.longOrNull ?: 0L,
+                    // The snapshot reports generation null only when the row is absent, and
+                    // that write ends as not_found; 0 keeps the fence shape well-formed.
+                    generation = (root["runtime_generation"] as? JsonPrimitive)?.longOrNull ?: 0L,
+                ),
+            )
+        },
+        onFailure = { error ->
+            // 404/405 = the pre-v0.22.3 route is absent → keep the old unfenced write.
+            // Anything else (timeout, 401, 500) is a real fault: an unfenced write would
+            // come back as a bogus "update the app" 409 and hide the actual failure.
+            val code = (error as? DashboardHttpException)?.statusCode
+            if (code == 404 || code == 405) Result.success(null) else Result.failure(error)
+        },
+    )
 
-    private fun JsonObjectBuilder.putMutationFence(fence: SessionMutationFence?) {
+    private fun JsonObjectBuilder.putMutationFence(
+        fence: SessionMutationFence?,
+        includeGeneration: Boolean = true,
+    ) {
         if (fence == null) return
         put("request_id", fence.requestId)
         put("expected_revision", fence.revision)
-        put("expected_generation", fence.generation)
+        // Only delete/rewind/reset/branch/model/compress are generation-fenced upstream;
+        // a sidebar write that carries one races the live turn's generation bump.
+        if (includeGeneration) put("expected_generation", fence.generation)
     }
 
     /**
@@ -1433,7 +1451,7 @@ class DashboardApiClient(
      * profile-scoped delete plumbing.
      */
     suspend fun deleteSession(sessionId: String, profile: String? = null): Result<JsonObject> {
-        val fence = sessionMutationFence(sessionId, profile)
+        val fence = sessionMutationFence(sessionId, profile).getOrElse { return Result.failure(it) }
         val base = "/api/sessions/${pathSegment(sessionId)}${profileQuery(profile)}"
         val path = if (fence == null) {
             base
@@ -1464,13 +1482,13 @@ class DashboardApiClient(
      * rides along for builds that scoped by query.
      */
     suspend fun renameSession(sessionId: String, title: String, profile: String? = null): Result<JsonObject> {
-        val fence = sessionMutationFence(sessionId, profile)
+        val fence = sessionMutationFence(sessionId, profile).getOrElse { return Result.failure(it) }
         return patchJsonObject(
             "/api/sessions/${pathSegment(sessionId)}${profileQuery(profile)}",
             buildJsonObject {
                 put("title", title)
                 profile?.trim()?.takeIf { it.isNotBlank() }?.let { put("profile", it) }
-                putMutationFence(fence)
+                putMutationFence(fence, includeGeneration = false)
             },
         )
     }
@@ -1488,13 +1506,13 @@ class DashboardApiClient(
         archived: Boolean,
         profile: String? = null,
     ): Result<JsonObject> {
-        val fence = sessionMutationFence(sessionId, profile)
+        val fence = sessionMutationFence(sessionId, profile).getOrElse { return Result.failure(it) }
         return patchJsonObject(
             "/api/sessions/${pathSegment(sessionId)}${profileQuery(profile)}",
             buildJsonObject {
                 put("archived", archived)
                 profile?.trim()?.takeIf { it.isNotBlank() }?.let { put("profile", it) }
-                putMutationFence(fence)
+                putMutationFence(fence, includeGeneration = false)
             },
         )
     }
@@ -1505,13 +1523,13 @@ class DashboardApiClient(
         pinned: Boolean,
         profile: String? = null,
     ): Result<JsonObject> {
-        val fence = sessionMutationFence(sessionId, profile)
+        val fence = sessionMutationFence(sessionId, profile).getOrElse { return Result.failure(it) }
         return patchJsonObject(
             "/api/sessions/${pathSegment(sessionId)}${profileQuery(profile)}",
             buildJsonObject {
                 put("pinned", pinned)
                 profile?.trim()?.takeIf { it.isNotBlank() }?.let { put("profile", it) }
-                putMutationFence(fence)
+                putMutationFence(fence, includeGeneration = false)
             },
         )
     }
