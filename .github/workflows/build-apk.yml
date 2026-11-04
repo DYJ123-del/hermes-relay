@@ -40,7 +40,26 @@ jobs:
       - name: Build debug APK
         run: ./gradlew assembleDebug --console=plain
 
-      - name: Build release APK (R8, debug-signed)
+      # Fixed release keystore → every build from this fork shares one signing
+      # identity, so releases upgrade over each other instead of demanding an
+      # uninstall. Absent secrets fall back to the debug keystore (build.gradle.kts).
+      - name: Decode release keystore
+        env:
+          HERMES_KEYSTORE_BASE64: ${{ secrets.HERMES_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$HERMES_KEYSTORE_BASE64" ]; then
+            echo "$HERMES_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "HERMES_KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+            echo "release keystore decoded"
+          else
+            echo "no keystore secret — falling back to the debug signing config"
+          fi
+
+      - name: Build release APK (R8)
+        env:
+          HERMES_KEYSTORE_PASSWORD: ${{ secrets.HERMES_KEYSTORE_PASSWORD }}
+          HERMES_KEY_ALIAS: ${{ secrets.HERMES_KEY_ALIAS }}
+          HERMES_KEY_PASSWORD: ${{ secrets.HERMES_KEY_PASSWORD }}
         run: ./gradlew assembleSideloadRelease --console=plain
 
       - name: List built APKs
