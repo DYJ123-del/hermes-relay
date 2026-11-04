@@ -17,6 +17,7 @@ import com.hermesandroid.relay.network.upstream.models.RepositoryPullRequestList
 import com.hermesandroid.relay.auth.SecureStoreCache
 import com.hermesandroid.relay.auth.SessionTokenStore
 import com.hermesandroid.relay.auth.buildRawTokenStore
+import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
@@ -29,6 +30,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
@@ -36,6 +38,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import okhttp3.Call
 import okhttp3.Callback
@@ -1385,6 +1388,42 @@ class DashboardApiClient(
     }
 
     /**
+     * Hermes v0.22.3+ refuses every session write that carries no *mutation
+     * identity*: `DELETE`/`PATCH /api/sessions/{id}` answer `409
+     * client_upgrade_required` when `request_id`/`expected_revision` are
+     * missing and `400 invalid_params` when only `expected_generation` is.
+     * The trio comes from `GET /api/sessions/{id}/mutation-snapshot` — the same
+     * preflight official Desktop runs before a sidebar control. Servers older
+     * than the fence answer 404 here; [sessionMutationFence] then returns null
+     * and the write goes out unfenced exactly as it always did.
+     */
+    private data class SessionMutationFence(
+        val requestId: String,
+        val revision: Long,
+        val generation: Long,
+    )
+
+    private suspend fun sessionMutationFence(
+        sessionId: String,
+        profile: String?,
+    ): SessionMutationFence? = getJsonObject(
+        "/api/sessions/${pathSegment(sessionId)}/mutation-snapshot${profileQuery(profile)}",
+    ).getOrNull()?.let { root ->
+        SessionMutationFence(
+            requestId = UUID.randomUUID().toString(),
+            revision = root["runtime_revision"]?.jsonPrimitive?.longOrNull ?: 0L,
+            generation = root["runtime_generation"]?.jsonPrimitive?.longOrNull ?: 0L,
+        )
+    }
+
+    private fun JsonObjectBuilder.putMutationFence(fence: SessionMutationFence?) {
+        if (fence == null) return
+        put("request_id", fence.requestId)
+        put("expected_revision", fence.revision)
+        put("expected_generation", fence.generation)
+    }
+
+    /**
      * Delete a session scoped to its owning profile via the dashboard
      * `DELETE /api/sessions/{id}?profile=`. The write twin of [listSessions]:
      * a non-default profile's sessions live in that profile's own `state.db`, so
@@ -1393,8 +1432,18 @@ class DashboardApiClient(
      * → the launch profile's DB (param omitted). Mirrors [deleteCronJob]'s
      * profile-scoped delete plumbing.
      */
-    suspend fun deleteSession(sessionId: String, profile: String? = null): Result<JsonObject> =
-        deleteJsonObject("/api/sessions/${pathSegment(sessionId)}${profileQuery(profile)}")
+    suspend fun deleteSession(sessionId: String, profile: String? = null): Result<JsonObject> {
+        val fence = sessionMutationFence(sessionId, profile)
+        val base = "/api/sessions/${pathSegment(sessionId)}${profileQuery(profile)}"
+        val path = if (fence == null) {
+            base
+        } else {
+            val separator = if (base.contains("?")) "&" else "?"
+            "$base${separator}request_id=${pathSegment(fence.requestId)}" +
+                "&expected_revision=${fence.revision}&expected_generation=${fence.generation}"
+        }
+        return deleteJsonObject(path)
+    }
 
     /**
      * Export one session as server-owned JSON metadata + messages. This is the
@@ -1414,14 +1463,17 @@ class DashboardApiClient(
      * reads `profile` from the PATCH body (`SessionRename`); the query param
      * rides along for builds that scoped by query.
      */
-    suspend fun renameSession(sessionId: String, title: String, profile: String? = null): Result<JsonObject> =
-        patchJsonObject(
+    suspend fun renameSession(sessionId: String, title: String, profile: String? = null): Result<JsonObject> {
+        val fence = sessionMutationFence(sessionId, profile)
+        return patchJsonObject(
             "/api/sessions/${pathSegment(sessionId)}${profileQuery(profile)}",
             buildJsonObject {
                 put("title", title)
                 profile?.trim()?.takeIf { it.isNotBlank() }?.let { put("profile", it) }
+                putMutationFence(fence)
             },
         )
+    }
 
     /**
      * Soft-archive or restore a session via the same dashboard
@@ -1435,28 +1487,34 @@ class DashboardApiClient(
         sessionId: String,
         archived: Boolean,
         profile: String? = null,
-    ): Result<JsonObject> =
-        patchJsonObject(
+    ): Result<JsonObject> {
+        val fence = sessionMutationFence(sessionId, profile)
+        return patchJsonObject(
             "/api/sessions/${pathSegment(sessionId)}${profileQuery(profile)}",
             buildJsonObject {
                 put("archived", archived)
                 profile?.trim()?.takeIf { it.isNotBlank() }?.let { put("profile", it) }
+                putMutationFence(fence)
             },
         )
+    }
 
     /** Persist the upstream keep flag that backs official-client session pins. */
     suspend fun setSessionPinned(
         sessionId: String,
         pinned: Boolean,
         profile: String? = null,
-    ): Result<JsonObject> =
-        patchJsonObject(
+    ): Result<JsonObject> {
+        val fence = sessionMutationFence(sessionId, profile)
+        return patchJsonObject(
             "/api/sessions/${pathSegment(sessionId)}${profileQuery(profile)}",
             buildJsonObject {
                 put("pinned", pinned)
                 profile?.trim()?.takeIf { it.isNotBlank() }?.let { put("profile", it) }
+                putMutationFence(fence)
             },
         )
+    }
 
     /**
      * Dry-run a server-backed bulk session cleanup via the dashboard

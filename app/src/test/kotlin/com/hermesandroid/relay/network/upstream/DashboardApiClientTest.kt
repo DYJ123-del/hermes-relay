@@ -1879,12 +1879,20 @@ class DashboardApiClientTest {
         server.enqueue(
             MockResponse()
                 .setHeader("Content-Type", "application/json")
+                .setBody("""{"session_id":"sess-old","exists":true,"runtime_revision":3,"runtime_generation":1}"""),
+        )
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
                 .setBody("""{"ok":true,"title":"Old plan","archived":true}"""),
         )
 
         val client = DashboardApiClient(baseUrl = server.url("/").toString())
         client.setSessionArchived("sess-old", archived = true, profile = "mizu").getOrThrow()
 
+        val snapshot = server.takeRequest()
+        assertEquals("GET", snapshot.method)
+        assertEquals("/api/sessions/sess-old/mutation-snapshot", snapshot.requestUrl!!.encodedPath)
         val request = server.takeRequest()
         assertEquals("PATCH", request.method)
         // Current upstream reads profile from the PATCH body (SessionRename
@@ -1901,12 +1909,18 @@ class DashboardApiClientTest {
         server.enqueue(
             MockResponse()
                 .setHeader("Content-Type", "application/json")
+                .setBody("""{"session_id":"sess-old","exists":true,"runtime_revision":0,"runtime_generation":0}"""),
+        )
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
                 .setBody("""{"ok":true,"title":"","archived":false}"""),
         )
 
         val client = DashboardApiClient(baseUrl = server.url("/").toString())
         client.setSessionArchived("sess-old", archived = false, profile = null).getOrThrow()
 
+        server.takeRequest()
         val request = server.takeRequest()
         assertEquals(null, request.requestUrl!!.queryParameter("profile"))
         val body = request.body.readUtf8()
@@ -1919,12 +1933,18 @@ class DashboardApiClientTest {
         server.enqueue(
             MockResponse()
                 .setHeader("Content-Type", "application/json")
+                .setBody("""{"session_id":"sess-keep","exists":true,"runtime_revision":2,"runtime_generation":0}"""),
+        )
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
                 .setBody("""{"ok":true,"pinned":true}"""),
         )
 
         val client = DashboardApiClient(baseUrl = server.url("/").toString())
         client.setSessionPinned("sess-keep", pinned = true, profile = "mizu").getOrThrow()
 
+        server.takeRequest()
         val request = server.takeRequest()
         assertEquals("PATCH", request.method)
         assertEquals("/api/sessions/sess-keep", request.requestUrl!!.encodedPath)
@@ -1939,12 +1959,18 @@ class DashboardApiClientTest {
         server.enqueue(
             MockResponse()
                 .setHeader("Content-Type", "application/json")
+                .setBody("""{"session_id":"sess-a","exists":true,"runtime_revision":5,"runtime_generation":2}"""),
+        )
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
                 .setBody("""{"ok":true,"title":"New title"}"""),
         )
 
         val client = DashboardApiClient(baseUrl = server.url("/").toString())
         client.renameSession("sess-a", title = "New title", profile = "mizu").getOrThrow()
 
+        server.takeRequest()
         val request = server.takeRequest()
         assertEquals("PATCH", request.method)
         assertEquals("/api/sessions/sess-a", request.requestUrl!!.encodedPath)
@@ -1953,6 +1979,53 @@ class DashboardApiClientTest {
         assertTrue(body.contains(""""title":"New title""""))
         // Current upstream reads profile from the PATCH body, not the query.
         assertTrue(body.contains(""""profile":"mizu""""))
+    }
+
+    @Test
+    fun deleteSession_sendsMutationFenceFromSnapshot() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
+                .setBody("""{"session_id":"sess-old","exists":true,"runtime_revision":7,"runtime_generation":2}"""),
+        )
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
+                .setBody("""{"ok":true,"deleted_ids":["sess-old"]}"""),
+        )
+
+        val client = DashboardApiClient(baseUrl = server.url("/").toString())
+        client.deleteSession("sess-old", profile = "mizu").getOrThrow()
+
+        val snapshot = server.takeRequest()
+        assertEquals("GET", snapshot.method)
+        assertEquals("/api/sessions/sess-old/mutation-snapshot", snapshot.requestUrl!!.encodedPath)
+        assertEquals("mizu", snapshot.requestUrl!!.queryParameter("profile"))
+        val delete = server.takeRequest()
+        assertEquals("DELETE", delete.method)
+        assertEquals("/api/sessions/sess-old", delete.requestUrl!!.encodedPath)
+        assertEquals("mizu", delete.requestUrl!!.queryParameter("profile"))
+        assertEquals("7", delete.requestUrl!!.queryParameter("expected_revision"))
+        assertEquals("2", delete.requestUrl!!.queryParameter("expected_generation"))
+        assertFalse(delete.requestUrl!!.queryParameter("request_id").isNullOrBlank())
+    }
+
+    @Test
+    fun deleteSession_stillDeletesWhenSnapshotEndpointIsAbsent() = runTest {
+        server.enqueue(MockResponse().setResponseCode(404).setBody("""{"detail":"Not Found"}"""))
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
+                .setBody("""{"ok":true,"deleted_ids":["sess-old"]}"""),
+        )
+
+        val client = DashboardApiClient(baseUrl = server.url("/").toString())
+        client.deleteSession("sess-old").getOrThrow()
+
+        server.takeRequest()
+        val delete = server.takeRequest()
+        assertEquals("DELETE", delete.method)
+        assertEquals(null, delete.requestUrl!!.queryParameter("request_id"))
     }
 
     @Test
