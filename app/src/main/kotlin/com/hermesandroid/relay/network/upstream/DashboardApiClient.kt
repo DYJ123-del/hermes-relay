@@ -1373,10 +1373,24 @@ class DashboardApiClient(
                 add("include_compacted=true")
                 if (name.isNotBlank()) add("profile=${pathSegment(name)}")
             }.joinToString(prefix = "?", separator = "&")
-            getJson(
+            val response = getJson(
                 "/api/sessions/${pathSegment(sessionId)}/messages$query",
                 callTimeoutMillis = sessionReadTimeoutMillis,
-            ).mapCatching { root ->
+            )
+            // A session the gateway minted but never persisted has no state.db
+            // row, so this route answers 404 "Session not found" until the first
+            // prompt lands (tui_gateway session.create writes the row lazily).
+            // That is an empty transcript, not a failure the user should see.
+            if (response.exceptionOrNull()?.isMissingSessionRow() == true) {
+                return@loadSessionMessages Result.success(
+                    SessionMessagePage(
+                        messages = emptyList(),
+                        pagination = null,
+                        payloadChars = 0,
+                    ),
+                )
+            }
+            response.mapCatching { root ->
                 val parsed = json.decodeFromJsonElement(MessageListResponse.serializer(), root)
                 SessionMessagePage(
                     messages = parsed.messages ?: parsed.data ?: parsed.items ?: emptyList(),
@@ -2671,6 +2685,23 @@ internal fun Throwable.isDashboardSignInRequiredFailure(): Boolean {
         if (current is DashboardHttpException && current.statusCode == 401) {
             return true
         }
+        current = current.cause
+    }
+    return false
+}
+
+/**
+ * True when the dashboard answered 404 for a session transcript because the id
+ * has no stored row yet (`session.create` mints the key lazily and persists the
+ * row on the first prompt). Callers treat it as an empty transcript.
+ */
+internal fun Throwable.isMissingSessionRow(): Boolean {
+    var current: Throwable? = this
+    val seen = java.util.Collections.newSetFromMap(
+        java.util.IdentityHashMap<Throwable, Boolean>(),
+    )
+    while (current != null && seen.add(current)) {
+        if (current is DashboardHttpException && current.statusCode == 404) return true
         current = current.cause
     }
     return false

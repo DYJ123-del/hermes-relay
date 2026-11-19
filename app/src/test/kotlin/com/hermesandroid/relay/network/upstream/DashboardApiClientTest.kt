@@ -608,6 +608,42 @@ class DashboardApiClientTest {
     }
 
     @Test
+    fun getSessionMessages_treatsMintedButUnpersistedSessionAsEmpty() = runTest {
+        // The gateway mints a new chat's id before any state.db row exists, so
+        // the transcript route answers 404 until the first prompt lands.
+        server.enqueue(
+            MockResponse().setResponseCode(404)
+                .setHeader("Content-Type", "application/json")
+                .setBody("""{"detail":"Session not found"}"""),
+        )
+        val client = DashboardApiClient(baseUrl = server.url("/").toString())
+
+        val messages = client
+            .getSessionMessages("20261119_213200_56de02", profile = "default")
+            .getOrThrow()
+
+        assertTrue(messages.isEmpty())
+        val url = server.takeRequest().requestUrl!!
+        assertEquals("/api/sessions/20261119_213200_56de02/messages", url.encodedPath)
+        assertEquals("default", url.queryParameter("profile"))
+    }
+
+    @Test
+    fun getSessionMessages_stillSurfacesServerErrors() = runTest {
+        server.enqueue(
+            MockResponse().setResponseCode(500)
+                .setHeader("Content-Type", "application/json")
+                .setBody("""{"detail":"boom"}"""),
+        )
+        val client = DashboardApiClient(baseUrl = server.url("/").toString())
+
+        val failure = client.getSessionMessages("sess-a").exceptionOrNull()
+
+        assertTrue(failure is DashboardHttpException)
+        assertEquals(500, (failure as DashboardHttpException).statusCode)
+    }
+
+    @Test
     fun providerUnavailableClassifierRejectsGeneric503() = runTest {
         server.enqueue(
             MockResponse().setResponseCode(503)
